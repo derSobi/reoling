@@ -7,7 +7,7 @@ use crate::transport::discovery::{connect_by_uid, PeerHandle};
 use crate::Error;
 use md5::{Digest, Md5};
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::channel;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
@@ -71,6 +71,18 @@ impl ReolinkClient {
         let mut client = Self::from_connection(connection, EncryptionProtocol::Unencrypted);
         client.direct_keepalive_task = keepalive;
         Ok(client)
+    }
+
+    /// Connects directly to a device's Baichuan "Basic Service" TCP port
+    /// (typically 9000) by IP — the explicit alternative to
+    /// `connect_by_uid`'s P2P path, chosen by the user, never a fallback.
+    /// No P2P handshake, no relay, no direct-connect keepalive (`C2D_HB`
+    /// has no meaning on a stable TCP connection — see
+    /// `BcConnection::spawn_direct_keepalive`).
+    pub async fn connect_by_ip(ip: std::net::IpAddr, port: u16) -> crate::Result<Self> {
+        let stream = TcpStream::connect((ip, port)).await?;
+        let connection = BcConnection::from_tcp(stream);
+        Ok(Self::from_connection(connection, EncryptionProtocol::Unencrypted))
     }
 
     /// Test/advanced entry point: wraps an already-established
@@ -595,6 +607,30 @@ mod tests {
         let second = frames.next().await.unwrap().unwrap();
         assert_eq!(second.data, vec![9, 9, 9]);
         assert_eq!(second.microseconds, 1000);
+
+        fake_camera.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_and_start_video_against_a_fake_tcp_camera() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_camera = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            run_fake_camera(BcConnection::from_tcp(stream)).await;
+        });
+
+        let mut client = ReolinkClient::connect_by_ip(addr.ip(), addr.port()).await.unwrap();
+
+        let _device_info = client.login("admin", "swordfish").await.unwrap();
+
+        let mut frames = client.start_video(0).await.unwrap();
+        let frame = frames.next().await.unwrap().unwrap();
+        assert_eq!(frame.data, vec![0, 0, 0, 1, 0x67]);
+        assert_eq!(frame.microseconds, 999);
 
         fake_camera.await.unwrap();
     }

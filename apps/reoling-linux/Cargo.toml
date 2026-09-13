@@ -11,7 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 reolink-core = { path = "../../crates/reolink-core" }
-gtk4 = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+# v4_6, not v4_10: Ubuntu 22.04 (still an LTS-supported target) ships GTK
+# 4.6 as its baseline. Bumping this feature raises the minimum GTK the
+# compiled binary can run against — only raise it if the app actually
+# needs a newer API.
+gtk4 = { version = "0.9", package = "gtk4", features = ["v4_6"] }
 glib = "0.20"
 async-channel = "2"
 gstreamer = "0.23"

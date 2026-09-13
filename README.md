@@ -1,4 +1,4 @@
-# <img src="apps/reoling-linux/data/icons/hicolor/512x512/apps/de.dersobi.reoling.png" width="32" valign="bottom"> Reoling
+# <img src="apps/reoling-linux/data/icons/hicolor/512x512/apps/de.dersobi.reoling.png" width="64" valign="middle"> **Reoling**  
 
 An unofficial client for Reolink® devices — cameras, NVRs, and Home Hubs —
 that connects over Reolink's proprietary "Baichuan" P2P protocol using only

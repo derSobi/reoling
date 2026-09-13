@@ -1,0 +1,27 @@
+# Ignoră tot
+*
+
+# Permite traversarea directoarelor
+!*/
+
+# Fișierele de la rădăcina proiectului
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/LICENSE
+!/README.md
+
+# Codul proiectului
+!/crates/**
+!/apps/**
+
+# Dar nu artefactele de build din interiorul lor
+**/target/
+
+# Directoare explicit excluse, fără nicio excepție (referințe externe cu
+# propriile lor repo-uri git, plan/spec-uri interne, jurnal local, config
+# de unealtă) — trebuie să vină DUPĂ `!*/`, ca reguli mai specifice care
+# au prioritate, altfel `!*/` le-ar re-permite ca "embedded git repos".
+/other/
+/.plans/
+/.claude/

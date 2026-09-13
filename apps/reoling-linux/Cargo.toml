@@ -1,0 +1,20 @@
+[package]
+name = "reoling-linux"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "reoling-linux"
+path = "src/main.rs"
+
+[dependencies]
+reolink-core = { path = "../../crates/reolink-core" }
+gtk4 = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+glib = "0.20"
+async-channel = "2"
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tokio-stream = "0.1"

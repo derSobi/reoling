@@ -1,0 +1,17 @@
+[package]
+name = "reolink-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reolink-protocol = { path = "../reolink-protocol" }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time", "macros"] }
+tokio-stream = "0.1"
+md-5 = "0.10"
+rand = "0.8"
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }

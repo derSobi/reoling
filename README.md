@@ -10,10 +10,12 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 ## Status
 
 Early development. The Baichuan protocol (binary framing, XML payloads,
-BCEncrypt/AES encryption, P2P discovery and NAT traversal) and the login
-flow are implemented and confirmed working end-to-end against real
-hardware. Live video decoding is in progress. There is no packaged release
-yet — see [Installation](#installation) below.
+BCEncrypt/AES encryption, P2P discovery and NAT traversal), login, and
+live video frame delivery are all confirmed working end-to-end against
+real hardware — both over a direct connection and through Reolink's relay
+infrastructure. Rendering that video in the desktop app's GStreamer
+pipeline is the remaining integration to verify. There is no packaged
+release yet — see [Installation](#installation) below.
 
 ## How it works
 

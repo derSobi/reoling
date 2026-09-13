@@ -1,4 +1,5 @@
 use reolink_core::{DeviceInfoSummary, ReolinkClient, VideoFrame};
+use std::net::IpAddr;
 use tokio_stream::StreamExt;
 
 pub enum AppEvent {
@@ -7,13 +8,20 @@ pub enum AppEvent {
     Failed(String),
 }
 
+/// How the user chose to reach the device — set by the explicit UID/IP
+/// toggle in the connect dialog, never inferred or auto-detected.
+pub enum ConnectTarget {
+    Uid(String),
+    Ip { addr: IpAddr, port: u16 },
+}
+
 /// Spawns a dedicated tokio runtime on a background OS thread and drives the
 /// whole connect→login→start_video flow there, forwarding progress to the
 /// GTK main loop over an `async-channel` (GTK4/GLib are not thread-safe, so
 /// no widget is ever touched off the main thread — the receiving end is
 /// driven by `glib::spawn_future_local` on the GLib main context).
 pub fn spawn_connection(
-    uid: String,
+    target: ConnectTarget,
     username: String,
     password: String,
     channel_id: u8,
@@ -23,7 +31,11 @@ pub fn spawn_connection(
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
         runtime.block_on(async move {
-            let mut client = match ReolinkClient::connect_by_uid(&uid).await {
+            let connect_result = match target {
+                ConnectTarget::Uid(uid) => ReolinkClient::connect_by_uid(&uid).await,
+                ConnectTarget::Ip { addr, port } => ReolinkClient::connect_by_ip(addr, port).await,
+            };
+            let mut client = match connect_result {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(AppEvent::Failed(e.to_string())).await;

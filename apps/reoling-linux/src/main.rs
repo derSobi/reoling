@@ -55,9 +55,9 @@ fn main() {
         let video_view_for_dialog = Rc::clone(&video_view);
         let header_for_dialog = header.clone();
         let dialog_widget_for_hide = dialog_container.clone();
-        build_connect_dialog(&dialog_container, move |device_name, uid, username, password, channel_id| {
+        build_connect_dialog(&dialog_container, move |device_name, target, username, password, channel_id| {
             status_label_for_dialog.set_text("Connecting...");
-            let receiver = spawn_connection(uid, username, password, channel_id);
+            let receiver = spawn_connection(target, username, password, channel_id);
             let status_label = status_label_for_dialog.clone();
             let video_view = Rc::clone(&video_view_for_dialog);
             let header = header_for_dialog.clone();

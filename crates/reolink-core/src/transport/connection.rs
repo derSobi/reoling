@@ -360,4 +360,40 @@ mod tests {
         let received = conn_b.recv_bc(&EncryptionProtocol::Unencrypted).await.unwrap();
         assert_eq!(received, bc);
     }
+
+    #[tokio::test]
+    async fn two_tcp_connections_round_trip_a_bc_message() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut conn = BcConnection::from_tcp(stream);
+            conn.recv_bc(&EncryptionProtocol::Unencrypted).await.unwrap()
+        });
+
+        let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_conn = BcConnection::from_tcp(client_stream);
+
+        let bc = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_LOGIN,
+                channel_id: 0,
+                stream_type: 0,
+                msg_num: 1,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg {
+                extension_xml: None,
+                payload: Some(b"<?xml version=\"1.0\"?><body/>".to_vec()),
+            }),
+        };
+        client_conn.send_bc(&bc, &EncryptionProtocol::Unencrypted).await.unwrap();
+
+        let received = server.await.unwrap();
+        assert_eq!(received, bc);
+    }
 }

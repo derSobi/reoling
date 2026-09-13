@@ -2,8 +2,10 @@ use crate::bc::header_codec::{read_header, write_header};
 use crate::bc::model::{
     has_payload_offset, Bc, BcBody, BcHeader, BcMeta, LegacyMsg, ModernMsg, MSG_ID_LOGIN,
 };
+use crate::bc::xml::Extension;
 use crate::crypto::EncryptionProtocol;
 use crate::Error;
+use std::collections::HashSet;
 
 pub fn write_bc(bc: &Bc, enc: &EncryptionProtocol) -> Vec<u8> {
     // Symmetric with `read_bc`'s override: the whole login exchange (both
@@ -58,7 +60,11 @@ pub fn write_bc(bc: &Bc, enc: &EncryptionProtocol) -> Vec<u8> {
     out
 }
 
-pub fn read_bc(buf: &[u8], enc: &EncryptionProtocol) -> crate::Result<Option<(Bc, usize)>> {
+pub fn read_bc(
+    buf: &[u8],
+    enc: &EncryptionProtocol,
+    bin_mode: &mut HashSet<u16>,
+) -> crate::Result<Option<(Bc, usize)>> {
     let Some((header, header_len)) = read_header(buf)? else {
         return Ok(None);
     };
@@ -139,10 +145,47 @@ pub fn read_bc(buf: &[u8], enc: &EncryptionProtocol) -> crate::Result<Option<(Bc
             } else {
                 Some(enc.decrypt(0, &body[..offset]))
             };
-            let payload = if offset == body.len() {
+            let parsed_extension =
+                extension_xml.as_ref().and_then(|xml| Extension::from_bytes(xml).ok());
+            if let Some(extension) = &parsed_extension {
+                match extension.binary_data {
+                    Some(1) => {
+                        bin_mode.insert(header.msg_num);
+                    }
+                    Some(0) => {
+                        bin_mode.remove(&header.msg_num);
+                    }
+                    _ => {}
+                }
+            }
+
+            let raw_payload = &body[offset..];
+            let payload = if raw_payload.is_empty() {
                 None
+            } else if bin_mode.contains(&header.msg_num) {
+                // Video/audio stream message. Real hardware only
+                // AES-encrypts the leading `encryptLen` bytes of the
+                // message that starts a new BcMedia unit (the one with
+                // `binaryData=1`); every later message of that same unit
+                // — even ones with their own `<Extension>` carrying just
+                // `checkPos`/`checkValue`, no `binaryData` — is sent
+                // fully in plaintext. Confirmed against real hardware
+                // 2026-09-14: decrypting those unconditionally, as this
+                // code used to do, XORs already-clear H.264/H.265 bytes
+                // with the wrong keystream and corrupts every frame past
+                // its first `encryptLen` bytes.
+                match parsed_extension.as_ref().and_then(|ext| ext.encrypt_len).map(|n| n as usize)
+                {
+                    Some(n) if n < raw_payload.len() => {
+                        let mut combined = enc.decrypt(offset as u32, &raw_payload[..n]);
+                        combined.extend_from_slice(&raw_payload[n..]);
+                        Some(combined)
+                    }
+                    Some(_) => Some(enc.decrypt(offset as u32, raw_payload)),
+                    None => Some(raw_payload.to_vec()),
+                }
             } else {
-                Some(enc.decrypt(offset as u32, &body[offset..]))
+                Some(enc.decrypt(offset as u32, raw_payload))
             };
             BcBody::Modern(ModernMsg {
                 extension_xml,
@@ -182,7 +225,7 @@ mod tests {
         let bytes = write_bc(&bc, &EncryptionProtocol::Unencrypted);
         assert_eq!(bytes.len(), 20); // header only, no body
 
-        let (parsed, consumed) = read_bc(&bytes, &EncryptionProtocol::Unencrypted)
+        let (parsed, consumed) = read_bc(&bytes, &EncryptionProtocol::Unencrypted, &mut HashSet::new())
             .unwrap()
             .unwrap();
         assert_eq!(consumed, 20);
@@ -239,7 +282,7 @@ mod tests {
         };
         let enc = EncryptionProtocol::BcEncrypt;
         let bytes = write_bc(&bc, &enc);
-        let (parsed, consumed) = read_bc(&bytes, &enc).unwrap().unwrap();
+        let (parsed, consumed) = read_bc(&bytes, &enc, &mut HashSet::new()).unwrap().unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(parsed, bc);
     }
@@ -280,7 +323,7 @@ mod tests {
         // Decoding those bytes while still passing the negotiated Aes
         // protocol must recover the original message (not garbage), i.e.
         // read_bc applies the same override on the way in.
-        let (parsed, _) = read_bc(&bytes, &aes).unwrap().unwrap();
+        let (parsed, _) = read_bc(&bytes, &aes, &mut HashSet::new()).unwrap().unwrap();
         assert_eq!(parsed, bc);
 
         // A non-login message id is unaffected: it really does use Aes.
@@ -308,6 +351,93 @@ mod tests {
         };
         let enc = EncryptionProtocol::Unencrypted;
         let bytes = write_bc(&bc, &enc);
-        assert!(read_bc(&bytes[..bytes.len() - 1], &enc).unwrap().is_none());
+        assert!(read_bc(&bytes[..bytes.len() - 1], &enc, &mut HashSet::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn continuation_chunks_of_a_video_unit_with_no_encrypt_len_are_left_undecrypted() {
+        // Regression test for a real-hardware bug (2026-09-14): a video/audio
+        // BcMedia unit's *first* message carries an `<Extension>` with
+        // `binaryData=1` and (usually) an `encryptLen` saying how many
+        // leading bytes of its payload are actually AES-encrypted; every
+        // later message of that same unit is sent fully in plaintext, some
+        // of them with their own `<Extension>` (just `checkPos`/
+        // `checkValue`, no `binaryData`). Decrypting those unconditionally
+        // corrupted every real video frame past its first message.
+        let key = [0x7u8; 16];
+        let aes = EncryptionProtocol::Aes { key };
+        let msg_num = 5;
+
+        // Message 1: starts the unit. First 4 bytes of the payload are
+        // genuinely encrypted; the last 4 are already plaintext, matching
+        // what `encryptLen` promises — built by hand (not `write_bc`, which
+        // always encrypts a payload in full) to control exactly which bytes
+        // are ciphertext on the wire.
+        let ext1 = Extension {
+            version: "1.1".to_string(),
+            binary_data: Some(1),
+            channel_id: None,
+            encrypt_len: Some(4),
+        }
+        .to_bytes();
+        let encrypted_ext1 = aes.encrypt(0, &ext1);
+        let plain_payload1 = b"ABCDWXYZ".to_vec();
+        let mut body1 = encrypted_ext1.clone();
+        body1.extend_from_slice(&aes.encrypt(0, &plain_payload1[..4]));
+        body1.extend_from_slice(&plain_payload1[4..]);
+        let header1 = BcHeader {
+            msg_id: MSG_ID_VIDEO,
+            body_len: body1.len() as u32,
+            channel_id: 0,
+            stream_type: 0,
+            msg_num,
+            response_code: 0,
+            class: 0x6414,
+            payload_offset: Some(encrypted_ext1.len() as u32),
+        };
+        let mut bytes1 = write_header(&header1);
+        bytes1.extend_from_slice(&body1);
+
+        let mut bin_mode = HashSet::new();
+        let (parsed1, _) = read_bc(&bytes1, &aes, &mut bin_mode).unwrap().unwrap();
+        let BcBody::Modern(ModernMsg { payload: Some(payload1), .. }) = parsed1.body else {
+            panic!("expected a modern payload");
+        };
+        assert_eq!(payload1, plain_payload1);
+
+        // Message 2: a pure continuation of the same unit — its own
+        // `<Extension>` has no `binaryData` (just a checkPos/checkValue
+        // self-check), and its payload is *already* plaintext on the wire.
+        let ext2 = Extension {
+            version: "1.1".to_string(),
+            binary_data: None,
+            channel_id: None,
+            encrypt_len: None,
+        }
+        .to_bytes();
+        let encrypted_ext2 = aes.encrypt(0, &ext2);
+        let plain_payload2 = b"continuation-bytes-in-the-clear".to_vec();
+        let mut body2 = encrypted_ext2.clone();
+        body2.extend_from_slice(&plain_payload2);
+        let header2 = BcHeader {
+            msg_id: MSG_ID_VIDEO,
+            body_len: body2.len() as u32,
+            channel_id: 0,
+            stream_type: 0,
+            msg_num,
+            response_code: 0,
+            class: 0x6414,
+            payload_offset: Some(encrypted_ext2.len() as u32),
+        };
+        let mut bytes2 = write_header(&header2);
+        bytes2.extend_from_slice(&body2);
+
+        let (parsed2, _) = read_bc(&bytes2, &aes, &mut bin_mode).unwrap().unwrap();
+        let BcBody::Modern(ModernMsg { payload: Some(payload2), .. }) = parsed2.body else {
+            panic!("expected a modern payload");
+        };
+        // The bug: AES-decrypting this already-clear payload would turn it
+        // into garbage. It must come back untouched.
+        assert_eq!(payload2, plain_payload2);
     }
 }

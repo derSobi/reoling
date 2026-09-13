@@ -105,6 +105,18 @@ pub struct Extension {
     pub binary_data: Option<u32>,
     #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<u8>,
+    /// How many leading bytes of the *following* payload are actually
+    /// AES-encrypted; the rest is sent as plaintext. Only present on the
+    /// message that starts a new BcMedia video/audio unit (the one with
+    /// `binary_data == Some(1)`) — confirmed against real hardware
+    /// 2026-09-14: messages of the same unit that lack this field
+    /// entirely (continuation chunks) are sent fully in plaintext, and
+    /// AES-decrypting them anyway corrupts every frame past its first
+    /// `encrypt_len` bytes. Real cameras also send a `checkPos`/
+    /// `checkValue` decryption self-check alongside this that we don't
+    /// currently need to verify against.
+    #[serde(rename = "encryptLen", skip_serializing_if = "Option::is_none")]
+    pub encrypt_len: Option<u32>,
 }
 
 impl Extension {

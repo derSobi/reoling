@@ -5,7 +5,7 @@ use reolink_protocol::bcudp::model::{BcUdp, UdpAck, UdpData};
 use reolink_protocol::crypto::EncryptionProtocol;
 use crate::transport::discovery::PeerHandle;
 use crate::Error;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -51,6 +51,10 @@ enum Socket {
 pub struct BcConnection {
     socket: Socket,
     reassembly: Vec<u8>,
+    // msg_nums a prior message told us (via <binaryData>) are mid video/audio
+    // stream — see `read_bc`'s own doc comment for why this matters for
+    // decryption of the chunks that follow.
+    bin_mode: HashSet<u16>,
 }
 
 impl BcConnection {
@@ -64,6 +68,7 @@ impl BcConnection {
                 out_of_order: BTreeMap::new(),
             },
             reassembly: Vec::new(),
+            bin_mode: HashSet::new(),
         }
     }
 
@@ -101,6 +106,7 @@ impl BcConnection {
         Self {
             socket: Socket::Tcp { stream },
             reassembly: Vec::new(),
+            bin_mode: HashSet::new(),
         }
     }
 
@@ -163,7 +169,7 @@ impl BcConnection {
 
     pub async fn recv_bc(&mut self, enc: &EncryptionProtocol) -> crate::Result<Bc> {
         // A message already fully reassembled from a previous call?
-        if let Some((bc, used)) = read_bc(&self.reassembly, enc)? {
+        if let Some((bc, used)) = read_bc(&self.reassembly, enc, &mut self.bin_mode)? {
             self.reassembly.drain(..used);
             return Ok(bc);
         }
@@ -201,7 +207,7 @@ impl BcConnection {
                 return Err(Error::ConnectionLost);
             }
             self.reassembly.extend_from_slice(&buf[..n]);
-            if let Some((bc, used)) = read_bc(&self.reassembly, enc)? {
+            if let Some((bc, used)) = read_bc(&self.reassembly, enc, &mut self.bin_mode)? {
                 self.reassembly.drain(..used);
                 return Ok(bc);
             }
@@ -259,7 +265,7 @@ impl BcConnection {
                     });
                     socket.send_to(&write_bcudp(&ack), peer.addr).await?;
 
-                    if let Some((bc, used)) = read_bc(&self.reassembly, enc)? {
+                    if let Some((bc, used)) = read_bc(&self.reassembly, enc, &mut self.bin_mode)? {
                         self.reassembly.drain(..used);
                         return Ok(bc);
                     }

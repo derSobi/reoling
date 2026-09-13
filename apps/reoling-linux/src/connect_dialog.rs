@@ -1,6 +1,7 @@
 use crate::bridge::ConnectTarget;
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, Entry, Grid, Label, Orientation, ToggleButton};
+use reolink_core::StreamQuality;
 
 fn labeled_row(grid: &Grid, row: i32, label_text: &str, entry: &Entry) {
     let label = Label::new(Some(label_text));
@@ -22,7 +23,7 @@ fn labeled_row(grid: &Grid, row: i32, label_text: &str, entry: &Entry) {
 /// IP+port, per the toggle), then username/password/channel.
 pub fn build_connect_dialog(
     container: &GtkBox,
-    on_connect: impl Fn(String, ConnectTarget, String, String, u8) + 'static,
+    on_connect: impl Fn(String, ConnectTarget, String, String, u8, StreamQuality) + 'static,
 ) {
     container.set_orientation(Orientation::Vertical);
     container.set_spacing(12);
@@ -83,6 +84,23 @@ pub fn build_connect_dialog(
     labeled_row(&grid, 6, "Channel", &channel_entry);
     container.append(&grid);
 
+    // Stream quality — mirrors the picker every official Reolink app (and
+    // `leolink`) exposes. Sub stream defaults on: over a relay/internet
+    // path (vs. direct LAN/VPN) the camera's full main-stream bitrate
+    // routinely outruns what the link can keep up with in real time.
+    let quality_label = Label::new(Some("Stream quality"));
+    quality_label.set_halign(gtk4::Align::Start);
+    container.append(&quality_label);
+    let quality_box = GtkBox::new(Orientation::Horizontal, 0);
+    quality_box.add_css_class("linked");
+    let sub_toggle = ToggleButton::with_label("Sub stream (smoother)");
+    let main_toggle = ToggleButton::with_label("Main stream (full res)");
+    main_toggle.set_group(Some(&sub_toggle));
+    sub_toggle.set_active(true);
+    quality_box.append(&sub_toggle);
+    quality_box.append(&main_toggle);
+    container.append(&quality_box);
+
     // IP mode starts hidden (UID is the default-active toggle above);
     // hidden widgets in a Grid collapse to zero height, so this doesn't
     // leave a visible gap.
@@ -124,10 +142,13 @@ pub fn build_connect_dialog(
     let user_entry_c = user_entry.clone();
     let pass_entry_c = pass_entry.clone();
     let channel_entry_c = channel_entry.clone();
+    let sub_toggle_c = sub_toggle.clone();
     let status_label_c = status_label.clone();
     connect_button.connect_clicked(move |_| {
         status_label_c.set_text("");
         let channel_id: u8 = channel_entry_c.text().parse().unwrap_or(0);
+        let quality =
+            if sub_toggle_c.is_active() { StreamQuality::Sub } else { StreamQuality::Main };
         let target = if uid_toggle_c.is_active() {
             ConnectTarget::Uid(uid_entry_c.text().to_string())
         } else {
@@ -153,6 +174,7 @@ pub fn build_connect_dialog(
             user_entry_c.text().to_string(),
             pass_entry_c.text().to_string(),
             channel_id,
+            quality,
         );
     });
 }

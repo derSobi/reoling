@@ -1,4 +1,4 @@
-use reolink_core::{DeviceInfoSummary, ReolinkClient, VideoFrame};
+use reolink_core::{DeviceInfoSummary, ReolinkClient, StreamQuality, VideoFrame};
 use std::net::IpAddr;
 use tokio_stream::StreamExt;
 
@@ -25,6 +25,7 @@ pub fn spawn_connection(
     username: String,
     password: String,
     channel_id: u8,
+    quality: StreamQuality,
 ) -> async_channel::Receiver<AppEvent> {
     let (tx, rx) = async_channel::unbounded();
 
@@ -51,7 +52,7 @@ pub fn spawn_connection(
             };
             let _ = tx.send(AppEvent::LoggedIn(device_info)).await;
 
-            let mut frames = match client.start_video(channel_id).await {
+            let mut frames = match client.start_video(channel_id, quality).await {
                 Ok(f) => f,
                 Err(e) => {
                     let _ = tx.send(AppEvent::Failed(e.to_string())).await;

@@ -12,11 +12,23 @@ use tokio::sync::mpsc::channel;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
-pub use reolink_protocol::bcmedia::model::VideoFrame;
+pub use reolink_protocol::bcmedia::model::{VideoFrame, VideoType};
 
 #[derive(Debug, Clone, Default)]
 pub struct DeviceInfoSummary {
     pub resolution_name: Option<String>,
+}
+
+/// Which of the camera's encode profiles to request in `start_video`.
+/// `Main` is full resolution/bitrate; `Sub` is a lower-resolution,
+/// lower-bitrate profile most cameras also encode continuously —
+/// matches the `<streamType>`/`handle` fields real Reolink apps
+/// (Windows/Mac/`leolink`) expose as a user-facing quality picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamQuality {
+    #[default]
+    Main,
+    Sub,
 }
 
 /// Mirrors `transport::discovery`'s established pattern of bounding every
@@ -311,13 +323,18 @@ impl ReolinkClient {
     pub async fn start_video(
         &mut self,
         channel_id: u8,
+        quality: StreamQuality,
     ) -> crate::Result<ReceiverStream<crate::Result<VideoFrame>>> {
         let msg_num = self.next_msg_num();
+        let (handle, stream_type_str) = match quality {
+            StreamQuality::Main => (0, "mainStream"),
+            StreamQuality::Sub => (1, "subStream"),
+        };
         let request = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_VIDEO,
                 channel_id,
-                stream_type: 0, // mainStream
+                stream_type: 0,
                 msg_num,
                 response_code: 0,
                 class: 0x6414,
@@ -329,8 +346,8 @@ impl ReolinkClient {
                         preview: Some(Preview {
                             version: XML_VERSION.to_string(),
                             channel_id,
-                            handle: 0,
-                            stream_type: Some("mainStream".to_string()),
+                            handle,
+                            stream_type: Some(stream_type_str.to_string()),
                         }),
                         ..Default::default()
                     }
@@ -541,6 +558,7 @@ mod tests {
                         version: XML_VERSION.to_string(),
                         binary_data: Some(1),
                         channel_id: Some(0),
+                        encrypt_len: Some(media_bytes.len() as u32),
                     }
                     .to_bytes(),
                 ),
@@ -577,6 +595,7 @@ mod tests {
                         version: XML_VERSION.to_string(),
                         binary_data: Some(1),
                         channel_id: Some(0),
+                        encrypt_len: Some(media_bytes_2.len() as u32),
                     }
                     .to_bytes(),
                 ),
@@ -607,7 +626,7 @@ mod tests {
 
         let _device_info = client.login("admin", "swordfish").await.unwrap();
 
-        let mut frames = client.start_video(0).await.unwrap();
+        let mut frames = client.start_video(0, StreamQuality::Main).await.unwrap();
         let frame = frames.next().await.unwrap().unwrap();
         assert_eq!(frame.data, vec![0, 0, 0, 1, 0x67]);
         assert_eq!(frame.microseconds, 999);
@@ -637,7 +656,7 @@ mod tests {
 
         let _device_info = client.login("admin", "swordfish").await.unwrap();
 
-        let mut frames = client.start_video(0).await.unwrap();
+        let mut frames = client.start_video(0, StreamQuality::Main).await.unwrap();
         let frame = frames.next().await.unwrap().unwrap();
         assert_eq!(frame.data, vec![0, 0, 0, 1, 0x67]);
         assert_eq!(frame.microseconds, 999);

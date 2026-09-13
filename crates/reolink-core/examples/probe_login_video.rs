@@ -3,7 +3,7 @@
 //! password interactively (never pass them as CLI args — they'd land in
 //! shell history) so run this directly in your own terminal.
 //! Usage: cargo run -p reolink-protocol --example probe_login_video -- <UID>
-use reolink_core::client::ReolinkClient;
+use reolink_core::client::{ReolinkClient, StreamQuality};
 use std::io::Write;
 use tokio_stream::StreamExt;
 
@@ -20,16 +20,22 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let uid = args
         .get(1)
-        .expect("usage: probe_login_video <UID> [--empty-nonce] [--prefer-direct] [--channel N]")
+        .expect("usage: probe_login_video <UID> [--empty-nonce] [--prefer-direct] [--channel N] [--dump-file PATH] [--sub-stream]")
         .clone();
     let empty_nonce_probe = args.iter().any(|a| a == "--empty-nonce");
     let prefer_direct = args.iter().any(|a| a == "--prefer-direct");
+    let quality = if args.iter().any(|a| a == "--sub-stream") { StreamQuality::Sub } else { StreamQuality::Main };
     let channel_id: u8 = args
         .iter()
         .position(|a| a == "--channel")
         .and_then(|i| args.get(i + 1))
         .map(|s| s.parse().expect("--channel expects a number"))
         .unwrap_or(0);
+    let dump_path = args
+        .iter()
+        .position(|a| a == "--dump-file")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let username = prompt("username");
     let password = prompt("password");
 
@@ -75,7 +81,7 @@ async fn main() {
     let _ = device_info;
 
     let start = std::time::Instant::now();
-    let mut frames = match client.start_video(channel_id).await {
+    let mut frames = match client.start_video(channel_id, quality).await {
         Ok(f) => {
             println!("start_video: SUCCESS in {:?}", start.elapsed());
             f
@@ -86,8 +92,13 @@ async fn main() {
         }
     };
 
+    let mut dump_file = dump_path.as_ref().map(|p| {
+        std::fs::File::create(p).unwrap_or_else(|e| panic!("could not create dump file {p}: {e}"))
+    });
+    let frame_target = if dump_file.is_some() { 300 } else { 10 };
+
     let mut count = 0;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break,
@@ -95,8 +106,15 @@ async fn main() {
                 match next {
                     Some(Ok(frame)) => {
                         count += 1;
-                        println!("frame #{count}: {} bytes, t={}us", frame.data.len(), frame.microseconds);
-                        if count >= 10 {
+                        println!("frame #{count}: {} bytes, t={}us, keyframe={}, video_type={:?}", frame.data.len(), frame.microseconds, frame.is_keyframe, frame.video_type);
+                        if let Some(file) = dump_file.as_mut() {
+                            file.write_all(&frame.data).expect("failed writing dump file");
+                        } else {
+                            let dump_len = frame.data.len().min(80);
+                            let hex: String = frame.data[..dump_len].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                            println!("  first {dump_len} bytes: {hex}");
+                        }
+                        if count >= frame_target {
                             break;
                         }
                     }

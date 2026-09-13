@@ -8,4 +8,4 @@ pub mod transport;
 pub mod client;
 
 pub use reolink_protocol::{Error, Result};
-pub use client::{DeviceInfoSummary, ReolinkClient, VideoFrame};
+pub use client::{DeviceInfoSummary, ReolinkClient, StreamQuality, VideoFrame, VideoType};

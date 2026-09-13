@@ -1,4 +1,4 @@
-# Reoling
+# <img src="apps/reoling-linux/data/icons/hicolor/512x512/apps/de.dersobi.reoling.png" width="32" valign="bottom"> Reoling
 
 An unofficial client for Reolink® devices — cameras, NVRs, and Home Hubs —
 that connects over Reolink's proprietary "Baichuan" P2P protocol using only
@@ -58,7 +58,7 @@ Requires:
 
 - Rust (edition 2021, `rust-version` 1.75+ — see the workspace
   `Cargo.toml`)
-- GTK4 (`>= 4.10`) and its development headers
+- GTK4 (`>= 4.6`, Ubuntu 22.04's baseline) and its development headers
 - GStreamer, including `gstreamer-app`, and a plugin capable of decoding
   H.264 (provided by your distribution)
 

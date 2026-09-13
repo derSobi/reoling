@@ -126,6 +126,7 @@ pub fn build_connect_dialog(
     let channel_entry_c = channel_entry.clone();
     let status_label_c = status_label.clone();
     connect_button.connect_clicked(move |_| {
+        status_label_c.set_text("");
         let channel_id: u8 = channel_entry_c.text().parse().unwrap_or(0);
         let target = if uid_toggle_c.is_active() {
             ConnectTarget::Uid(uid_entry_c.text().to_string())

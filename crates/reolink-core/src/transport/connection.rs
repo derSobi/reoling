@@ -8,67 +8,121 @@ use crate::Error;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 
 /// Leaves headroom under the negotiated 1350-byte MTU for the UdpData
-/// header (20 bytes) and IP/UDP overhead.
+/// header (20 bytes) and IP/UDP overhead. Only meaningful for the UDP
+/// variant — TCP has no such envelope and sends `write_bc`'s output
+/// unchunked.
 const MAX_FRAGMENT_SIZE: usize = 1300;
 
 /// `recv_bc`'s receive loop skips discovery-channel packets it doesn't act
 /// on (see below) rather than erroring — without a bound on the whole loop,
 /// a peer that only ever sends chatter (or nothing at all) on that channel
 /// hangs the call forever. Matches `transport::discovery`'s own
-/// `OVERALL_TIMEOUT`.
+/// `OVERALL_TIMEOUT`. Applies to both variants.
 const RECV_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The two ways a `BcConnection` can actually be talking to a device.
+/// `Bc`-level framing (`read_bc`/`write_bc`) and encryption are identical
+/// either way — only the raw bytes-on-the-wire mechanics differ, so this
+/// enum is the only place that knows the difference.
+enum Socket {
+    /// P2P (UID-resolved, direct or relay). Needs the `BcUdp` envelope:
+    /// fragmentation into `MAX_FRAGMENT_SIZE` chunks, ACKs, out-of-order
+    /// reassembly by `packet_id`, and a negotiated peer to validate
+    /// incoming datagrams against.
+    Udp {
+        socket: Arc<UdpSocket>,
+        peer: PeerHandle,
+        send_packet_id: u32,
+        next_expected_packet_id: u32,
+        out_of_order: BTreeMap<u32, Vec<u8>>,
+    },
+    /// Direct TCP (Baichuan's "Basic Service", typically port 9000). A
+    /// plain ordered byte stream — `write_bc`'s output goes straight on
+    /// the wire with no envelope, and `read_bc` already knows how to wait
+    /// for "not enough bytes yet" (`Ok(None)`), which is exactly what an
+    /// incrementally-filled TCP buffer needs.
+    Tcp { stream: TcpStream },
+}
+
 pub struct BcConnection {
-    socket: Arc<UdpSocket>,
-    peer: PeerHandle,
-    send_packet_id: u32,
-    next_expected_packet_id: u32,
-    out_of_order: BTreeMap<u32, Vec<u8>>,
+    socket: Socket,
     reassembly: Vec<u8>,
 }
 
 impl BcConnection {
     pub fn new(socket: Arc<UdpSocket>, peer: PeerHandle) -> Self {
         Self {
-            socket,
-            peer,
-            send_packet_id: 0,
-            next_expected_packet_id: 0,
-            out_of_order: BTreeMap::new(),
+            socket: Socket::Udp {
+                socket,
+                peer,
+                send_packet_id: 0,
+                next_expected_packet_id: 0,
+                out_of_order: BTreeMap::new(),
+            },
             reassembly: Vec::new(),
         }
     }
 
     /// The login nonce delivered during the relay handshake, if any — see
-    /// [`PeerHandle::nonce`].
+    /// [`PeerHandle::nonce`]. Always `None` on a direct TCP connection —
+    /// that path has no P2P handshake to carry one; `login()` falls back
+    /// to the legacy nonce exchange exactly as it does for a nonce-less
+    /// UDP connection.
     pub fn peer_nonce(&self) -> Option<&str> {
-        self.peer.nonce.as_deref()
+        match &self.socket {
+            Socket::Udp { peer, .. } => peer.nonce.as_deref(),
+            Socket::Tcp { .. } => None,
+        }
     }
 
     /// The peer's address this connection is actually talking to —
-    /// diagnostic only, to tell a direct connection apart from a relay one.
+    /// diagnostic only, to tell a direct connection apart from a relay
+    /// one. `TcpStream::peer_addr()` is documented to succeed once
+    /// `connect()` has already returned `Ok`, which is the only way a
+    /// `Socket::Tcp` gets constructed (see `from_tcp`) — the `.expect()`
+    /// here can't actually fail.
     pub fn peer_addr(&self) -> std::net::SocketAddr {
-        self.peer.addr
+        match &self.socket {
+            Socket::Udp { peer, .. } => peer.addr,
+            Socket::Tcp { stream } => stream
+                .peer_addr()
+                .expect("peer_addr always succeeds after a successful TcpStream::connect"),
+        }
     }
 
-    /// On a direct (non-relay) connection, spawns a background task that
-    /// sends `C2D_HB` to the device once a second for as long as the
+    /// Wraps an already-connected `TcpStream` (Baichuan's direct TCP
+    /// "Basic Service", typically port 9000) as a `BcConnection`.
+    pub fn from_tcp(stream: TcpStream) -> Self {
+        Self {
+            socket: Socket::Tcp { stream },
+            reassembly: Vec::new(),
+        }
+    }
+
+    /// On a direct (non-relay) **UDP** connection, spawns a background task
+    /// that sends `C2D_HB` to the device once a second for as long as the
     /// returned handle is held. No-op (returns `None`) on a relay
-    /// connection. Real hardware, confirmed 2026-09-13: without this, the
-    /// device just keeps retransmitting its `D2C_C_R` handshake reply every
-    /// ~500ms and never processes any BC data sent to it — see
-    /// `UdpXml::C2dHb`.
+    /// connection, and always `None` on TCP — `C2D_HB` is a P2P/UDP NAT
+    /// keepalive with no TCP equivalent; a stable TCP connection needs no
+    /// such mechanism and must not send one. Real hardware, confirmed
+    /// 2026-09-13: without this on the UDP direct path, the device just
+    /// keeps retransmitting its `D2C_C_R` handshake reply every ~500ms and
+    /// never processes any BC data sent to it — see `UdpXml::C2dHb`.
     pub fn spawn_direct_keepalive(&self) -> Option<tokio::task::JoinHandle<()>> {
-        if !self.peer.is_direct {
+        let Socket::Udp { socket, peer, .. } = &self.socket else {
+            return None;
+        };
+        if !peer.is_direct {
             return None;
         }
-        let socket = self.socket.clone();
-        let addr = self.peer.addr;
-        let cid = self.peer.local_connection_id;
-        let did = self.peer.remote_connection_id;
+        let socket = socket.clone();
+        let addr = peer.addr;
+        let cid = peer.local_connection_id;
+        let did = peer.remote_connection_id;
         Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
@@ -86,18 +140,24 @@ impl BcConnection {
 
     pub async fn send_bc(&mut self, bc: &Bc, enc: &EncryptionProtocol) -> crate::Result<()> {
         let bytes = write_bc(bc, enc);
-        for chunk in bytes.chunks(MAX_FRAGMENT_SIZE) {
-            let packet = BcUdp::Data(UdpData {
-                connection_id: self.peer.remote_connection_id,
-                packet_id: self.send_packet_id,
-                payload: chunk.to_vec(),
-            });
-            self.socket
-                .send_to(&write_bcudp(&packet), self.peer.addr)
-                .await?;
-            self.send_packet_id += 1;
+        match &mut self.socket {
+            Socket::Udp { socket, peer, send_packet_id, .. } => {
+                for chunk in bytes.chunks(MAX_FRAGMENT_SIZE) {
+                    let packet = BcUdp::Data(UdpData {
+                        connection_id: peer.remote_connection_id,
+                        packet_id: *send_packet_id,
+                        payload: chunk.to_vec(),
+                    });
+                    socket.send_to(&write_bcudp(&packet), peer.addr).await?;
+                    *send_packet_id += 1;
+                }
+                Ok(())
+            }
+            Socket::Tcp { stream } => {
+                stream.write_all(&bytes).await?;
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     pub async fn recv_bc(&mut self, enc: &EncryptionProtocol) -> crate::Result<Bc> {
@@ -113,10 +173,53 @@ impl BcConnection {
     }
 
     async fn recv_bc_loop(&mut self, enc: &EncryptionProtocol) -> crate::Result<Bc> {
+        if matches!(self.socket, Socket::Tcp { .. }) {
+            self.recv_bc_loop_tcp(enc).await
+        } else {
+            self.recv_bc_loop_udp(enc).await
+        }
+    }
+
+    async fn recv_bc_loop_tcp(&mut self, enc: &EncryptionProtocol) -> crate::Result<Bc> {
         let mut buf = [0u8; 2048];
         loop {
-            let (n, from) = self.socket.recv_from(&mut buf).await?;
-            if from != self.peer.addr {
+            // Scoped to just this read: the mutable borrow of `self.socket`
+            // must not overlap the `self.reassembly` access below it, or
+            // the borrow checker sees two live mutable borrows of `self`
+            // across the same `.await`.
+            let n = {
+                let Socket::Tcp { stream } = &mut self.socket else {
+                    unreachable!("recv_bc_loop_tcp called on a non-TCP connection");
+                };
+                stream.read(&mut buf).await?
+            };
+            if n == 0 {
+                // The peer closed the connection — there is no BC-level
+                // "goodbye" on this transport the way `D2C_DISC` is one on
+                // UDP; a clean TCP EOF just means the session is over.
+                return Err(Error::ConnectionLost);
+            }
+            self.reassembly.extend_from_slice(&buf[..n]);
+            if let Some((bc, used)) = read_bc(&self.reassembly, enc)? {
+                self.reassembly.drain(..used);
+                return Ok(bc);
+            }
+        }
+    }
+
+    async fn recv_bc_loop_udp(&mut self, enc: &EncryptionProtocol) -> crate::Result<Bc> {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, from) = {
+                let Socket::Udp { socket, .. } = &self.socket else {
+                    unreachable!("recv_bc_loop_udp called on a non-UDP connection");
+                };
+                socket.recv_from(&mut buf).await?
+            };
+            let Socket::Udp { peer, .. } = &self.socket else {
+                unreachable!("recv_bc_loop_udp called on a non-UDP connection");
+            };
+            if from != peer.addr {
                 // Ignore datagrams from anyone but our negotiated peer —
                 // the socket is unconnected, so without this check any host
                 // that can reach our ephemeral port could inject or
@@ -135,24 +238,25 @@ impl BcConnection {
             };
             match msg {
                 BcUdp::Data(data) => {
-                    self.out_of_order.insert(data.packet_id, data.payload);
-                    while let Some(chunk) =
-                        self.out_of_order.remove(&self.next_expected_packet_id)
-                    {
+                    let Socket::Udp { socket, peer, next_expected_packet_id, out_of_order, .. } =
+                        &mut self.socket
+                    else {
+                        unreachable!("recv_bc_loop_udp called on a non-UDP connection");
+                    };
+                    out_of_order.insert(data.packet_id, data.payload);
+                    while let Some(chunk) = out_of_order.remove(next_expected_packet_id) {
                         self.reassembly.extend_from_slice(&chunk);
-                        self.next_expected_packet_id += 1;
+                        *next_expected_packet_id += 1;
                     }
 
                     let ack = BcUdp::Ack(UdpAck {
-                        connection_id: self.peer.remote_connection_id,
+                        connection_id: peer.remote_connection_id,
                         group_id: 0,
-                        packet_id: self.next_expected_packet_id.wrapping_sub(1),
+                        packet_id: next_expected_packet_id.wrapping_sub(1),
                         maybe_latency: 0,
                         payload: vec![],
                     });
-                    self.socket
-                        .send_to(&write_bcudp(&ack), self.peer.addr)
-                        .await?;
+                    socket.send_to(&write_bcudp(&ack), peer.addr).await?;
 
                     if let Some((bc, used)) = read_bc(&self.reassembly, enc)? {
                         self.reassembly.drain(..used);

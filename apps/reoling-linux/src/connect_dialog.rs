@@ -139,11 +139,11 @@ pub fn build_connect_dialog(
                 }
             };
             let port: u16 = match port_entry_c.text().parse() {
-                Ok(port) => port,
-                Err(_) => {
+                Ok(0) | Err(_) => {
                     status_label_c.set_text("Invalid port");
                     return;
                 }
+                Ok(port) => port,
             };
             ConnectTarget::Ip { addr, port }
         };

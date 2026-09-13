@@ -81,10 +81,11 @@ impl BcConnection {
 
     /// The peer's address this connection is actually talking to —
     /// diagnostic only, to tell a direct connection apart from a relay
-    /// one. `TcpStream::peer_addr()` is documented to succeed once
-    /// `connect()` has already returned `Ok`, which is the only way a
-    /// `Socket::Tcp` gets constructed (see `from_tcp`) — the `.expect()`
-    /// here can't actually fail.
+    /// one. `TcpStream::peer_addr()` succeeds on any connected socket —
+    /// every real construction of `Socket::Tcp` (via `from_tcp`, whether
+    /// fed a `TcpStream::connect` result in `ReolinkClient::connect_by_ip`
+    /// or a `TcpListener::accept()` result in tests) already holds a
+    /// connected stream, so the `.expect()` here can't actually fail.
     pub fn peer_addr(&self) -> std::net::SocketAddr {
         match &self.socket {
             Socket::Udp { peer, .. } => peer.addr,
@@ -395,5 +396,65 @@ mod tests {
 
         let received = server.await.unwrap();
         assert_eq!(received, bc);
+    }
+
+    #[tokio::test]
+    async fn a_large_tcp_message_is_read_incrementally_and_reassembled() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut conn = BcConnection::from_tcp(stream);
+            conn.recv_bc(&EncryptionProtocol::Unencrypted).await.unwrap()
+        });
+
+        let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_conn = BcConnection::from_tcp(client_stream);
+
+        // Several times the TCP read buffer (2048 bytes in recv_bc_loop_tcp),
+        // forcing multiple `stream.read()` calls through the reassembly loop
+        // — the same value the UDP fragmentation test uses.
+        let big_payload = vec![0xABu8; 5000];
+        let bc = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_VIDEO,
+                channel_id: 0,
+                stream_type: 0,
+                msg_num: 2,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::Modern(ModernMsg {
+                extension_xml: None,
+                payload: Some(big_payload),
+            }),
+        };
+        client_conn.send_bc(&bc, &EncryptionProtocol::Unencrypted).await.unwrap();
+
+        let received = server.await.unwrap();
+        assert_eq!(received, bc);
+    }
+
+    #[tokio::test]
+    async fn tcp_connection_closed_by_peer_surfaces_as_connection_lost() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream); // close without sending anything
+        });
+
+        let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_conn = BcConnection::from_tcp(client_stream);
+
+        server.await.unwrap();
+        let result = client_conn.recv_bc(&EncryptionProtocol::Unencrypted).await;
+        assert!(matches!(result, Err(Error::ConnectionLost)));
     }
 }

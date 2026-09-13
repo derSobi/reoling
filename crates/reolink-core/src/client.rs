@@ -19,6 +19,13 @@ pub struct DeviceInfoSummary {
     pub resolution_name: Option<String>,
 }
 
+/// Mirrors `transport::discovery`'s established pattern of bounding every
+/// network wait explicitly (see `OVERALL_TIMEOUT`/`DNS_TIMEOUT` there) — a
+/// silently-unreachable IP (the most common user mistake: right subnet,
+/// wrong last octet) would otherwise hang on the OS's own SYN timeout,
+/// commonly over a minute, with the connect dialog frozen on "Connecting...".
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct ReolinkClient {
     connection: Arc<Mutex<BcConnection>>,
     encryption: EncryptionProtocol,
@@ -80,7 +87,10 @@ impl ReolinkClient {
     /// has no meaning on a stable TCP connection — see
     /// `BcConnection::spawn_direct_keepalive`).
     pub async fn connect_by_ip(ip: std::net::IpAddr, port: u16) -> crate::Result<Self> {
-        let stream = TcpStream::connect((ip, port)).await?;
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((ip, port)))
+            .await
+            .map_err(|_| Error::ProtocolError(format!("connecting to {ip}:{port} timed out")))?
+            .map_err(|e| Error::ProtocolError(format!("could not connect to {ip}:{port}: {e}")))?;
         let connection = BcConnection::from_tcp(stream);
         Ok(Self::from_connection(connection, EncryptionProtocol::Unencrypted))
     }

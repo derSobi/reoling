@@ -11,11 +11,14 @@ Reoling is not affiliated with, endorsed by, or sponsored by Reolink.
 
 Early development. The Baichuan protocol (binary framing, XML payloads,
 BCEncrypt/AES encryption, P2P discovery and NAT traversal), login, and
-live video frame delivery are all confirmed working end-to-end against
-real hardware — both over a direct connection and through Reolink's relay
-infrastructure. Rendering that video in the desktop app's GStreamer
-pipeline is the remaining integration to verify. There is no packaged
-release yet — see [Installation](#installation) below.
+live video are confirmed working end-to-end against real hardware,
+rendered in the desktop app itself (H.264 and H.265, auto-detected) —
+both over a direct connection (upgraded to TCP when reachable) and
+through Reolink's relay infrastructure. Playback is smooth on the sub
+stream; the full-resolution main stream can still stutter on
+higher-bitrate cameras, a known limitation still being investigated.
+There is no packaged release yet — see [Installation](#installation)
+below.
 
 ## How it works
 
@@ -61,8 +64,8 @@ Requires:
 - Rust (edition 2021, `rust-version` 1.75+ — see the workspace
   `Cargo.toml`)
 - GTK4 (`>= 4.6`, Ubuntu 22.04's baseline) and its development headers
-- GStreamer, including `gstreamer-app`, and a plugin capable of decoding
-  H.264 (provided by your distribution)
+- GStreamer, including `gstreamer-app` and `gstreamer-libav` (H.264/H.265
+  software decoding — provided by your distribution)
 
 ```bash
 cargo build --release -p reoling-linux

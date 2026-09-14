@@ -17,12 +17,36 @@ use tokio::net::{TcpStream, UdpSocket};
 /// unchunked.
 const MAX_FRAGMENT_SIZE: usize = 1300;
 
+/// Upper bound on how many entries an ack's missing-packet bitmap covers
+/// (see `build_ack_payload`) — a stray/malicious `packet_id` far ahead of
+/// `next_expected_packet_id` must not drive a multi-GiB allocation here.
+const ACK_BITMAP_CAP: u32 = 4096;
+
 /// `recv_bc`'s receive loop skips discovery-channel packets it doesn't act
 /// on (see below) rather than erroring — without a bound on the whole loop,
 /// a peer that only ever sends chatter (or nothing at all) on that channel
 /// hangs the call forever. Matches `transport::discovery`'s own
 /// `OVERALL_TIMEOUT`. Applies to both variants.
 const RECV_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Builds the ack payload documented in `UdpAck`: a `00`/`01` truth table
+/// for every packet_id after the one this ack covers, saying which of them
+/// have *already* been received out of order. Real hardware resends
+/// anything past the acked `packet_id` it doesn't otherwise hear was
+/// received — without this, our own acks (previously always empty) gave it
+/// no way to tell an already-reassembled out-of-order packet apart from a
+/// genuinely lost one, which is one plausible explanation for the roughly
+/// one-second bursty stutter seen on the relay-only (non-direct) path;
+/// matches `bairelay`'s own `build_send_ack`, the only reference among the
+/// three read for this project that actually populates this field instead
+/// of leaving it empty like `neolink` does.
+fn build_ack_payload(next_expected: u32, out_of_order: &BTreeMap<u32, Vec<u8>>) -> Vec<u8> {
+    let Some(&highest) = out_of_order.keys().next_back() else {
+        return Vec::new();
+    };
+    let end_exclusive = highest.saturating_add(1).min(next_expected.saturating_add(ACK_BITMAP_CAP));
+    (next_expected..end_exclusive).map(|id| u8::from(out_of_order.contains_key(&id))).collect()
+}
 
 /// The two ways a `BcConnection` can actually be talking to a device.
 /// `Bc`-level framing (`read_bc`/`write_bc`) and encryption are identical
@@ -261,7 +285,7 @@ impl BcConnection {
                         group_id: 0,
                         packet_id: next_expected_packet_id.wrapping_sub(1),
                         maybe_latency: 0,
-                        payload: vec![],
+                        payload: build_ack_payload(*next_expected_packet_id, out_of_order),
                     });
                     socket.send_to(&write_bcudp(&ack), peer.addr).await?;
 
@@ -366,6 +390,29 @@ mod tests {
         conn_a.send_bc(&bc, &EncryptionProtocol::Unencrypted).await.unwrap();
         let received = conn_b.recv_bc(&EncryptionProtocol::Unencrypted).await.unwrap();
         assert_eq!(received, bc);
+    }
+
+    #[test]
+    fn ack_payload_marks_out_of_order_packets_received_and_gaps_missing() {
+        // next_expected_packet_id is 6 (the gap); 7 and 9 arrived out of
+        // order, 8 did not.
+        let mut out_of_order = BTreeMap::new();
+        out_of_order.insert(7u32, vec![]);
+        out_of_order.insert(9u32, vec![]);
+        assert_eq!(build_ack_payload(6, &out_of_order), vec![0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn ack_payload_is_empty_when_nothing_arrived_out_of_order() {
+        assert_eq!(build_ack_payload(6, &BTreeMap::new()), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn ack_payload_is_capped_against_a_wild_far_ahead_packet_id() {
+        let mut out_of_order = BTreeMap::new();
+        out_of_order.insert(6u32, vec![]);
+        out_of_order.insert(u32::MAX, vec![]); // absurdly far ahead
+        assert_eq!(build_ack_payload(6, &out_of_order).len(), ACK_BITMAP_CAP as usize);
     }
 
     #[tokio::test]

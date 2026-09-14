@@ -92,6 +92,39 @@ impl ReolinkClient {
         Ok(client)
     }
 
+    /// Resolves `uid` the same way `connect_by_uid_prefer_direct` does, but
+    /// when that resolution reaches the device directly (not through
+    /// relay), continues the session over TCP:9000 (`connect_by_ip`)
+    /// instead of the UDP/P2P transport. `.plans/reolink-protocols.md`
+    /// documents Baichuan TCP as the NVR/powered-camera family's primary,
+    /// most complete protocol — UDP exists mainly for discovery, NAT
+    /// traversal, and battery cameras. Confirmed against real hardware
+    /// 2026-09-14: over the UDP path, video stuttered in roughly
+    /// one-second bursts (`BcUdp`'s own retransmission bitmap isn't
+    /// implemented yet — see `bcudp::model::UdpAck`); the exact same
+    /// session over this TCP path delivered frames smoothly (44-78ms
+    /// apart) with no stutter at all, TCP's in-kernel retransmission and
+    /// ordering sidestepping the problem entirely instead of `BcUdp`
+    /// needing a real fix. Falls back to the UDP session if the device
+    /// only resolved via relay, or if the direct TCP connect itself
+    /// fails.
+    pub async fn connect_by_uid_prefer_tcp(uid: &str) -> crate::Result<Self> {
+        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let peer: PeerHandle =
+            crate::transport::discovery::connect_by_uid_prefer_direct(&socket, uid).await?;
+        if peer.is_direct {
+            const BASIC_SERVICE_PORT: u16 = 9000;
+            if let Ok(client) = Self::connect_by_ip(peer.addr.ip(), BASIC_SERVICE_PORT).await {
+                return Ok(client);
+            }
+        }
+        let connection = BcConnection::new(socket, peer);
+        let keepalive = connection.spawn_direct_keepalive();
+        let mut client = Self::from_connection(connection, EncryptionProtocol::Unencrypted);
+        client.direct_keepalive_task = keepalive;
+        Ok(client)
+    }
+
     /// Connects directly to a device's Baichuan "Basic Service" TCP port
     /// (typically 9000) by IP — the explicit alternative to
     /// `connect_by_uid`'s P2P path, chosen by the user, never a fallback.

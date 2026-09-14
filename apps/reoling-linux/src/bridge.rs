@@ -33,7 +33,15 @@ pub fn spawn_connection(
         let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
         runtime.block_on(async move {
             let connect_result = match target {
-                ConnectTarget::Uid(uid) => ReolinkClient::connect_by_uid(&uid).await,
+                // Prefers TCP:9000 over the plain UDP/P2P session whenever
+                // UID resolution reaches the device directly (not via
+                // relay) — confirmed against real hardware 2026-09-14:
+                // the UDP path stutters in ~1s bursts (its own
+                // retransmission bitmap, `bcudp::model::UdpAck`, isn't
+                // implemented), while TCP's in-kernel retransmission and
+                // ordering delivers frames smoothly. See
+                // `ReolinkClient::connect_by_uid_prefer_tcp`.
+                ConnectTarget::Uid(uid) => ReolinkClient::connect_by_uid_prefer_tcp(&uid).await,
                 ConnectTarget::Ip { addr, port } => ReolinkClient::connect_by_ip(addr, port).await,
             };
             let mut client = match connect_result {

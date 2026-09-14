@@ -7,7 +7,10 @@ use connect_dialog::build_connect_dialog;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Button, HeaderBar, Label};
 use std::rc::Rc;
+use std::time::Duration;
 use video_view::VideoView;
+
+const STATUS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 fn main() {
     gstreamer::init().expect("failed to initialize GStreamer");
@@ -75,6 +78,16 @@ fn main() {
             let header = header_for_dialog.clone();
             let dialog_widget = dialog_widget_for_hide.clone();
             glib::spawn_future_local(async move {
+                // Setting label text triggers GTK layout/redraw work on
+                // this same main thread that also composites the video
+                // texture — updating it on every single frame (dozens of
+                // times a second) competed with that rendering for the
+                // thread and made playback choppier the higher the frame
+                // rate, confirmed against real hardware 2026-09-14 (worse
+                // on the higher-bitrate main stream, but present on sub
+                // stream too, just less noticeable). Throttled to once a
+                // second; the byte count was diagnostic-only anyway.
+                let mut last_status_update = std::time::Instant::now() - STATUS_UPDATE_INTERVAL;
                 while let Ok(event) = receiver.recv().await {
                     match event {
                         AppEvent::LoggedIn(_info) => {
@@ -91,8 +104,13 @@ fn main() {
                             header.set_title_widget(Some(&Label::new(Some(&title))));
                         }
                         AppEvent::Frame(frame) => {
-                            status_label
-                                .set_text(&format!("Streaming ({} bytes/frame)", frame.data.len()));
+                            if last_status_update.elapsed() >= STATUS_UPDATE_INTERVAL {
+                                status_label.set_text(&format!(
+                                    "Streaming ({} bytes/frame)",
+                                    frame.data.len()
+                                ));
+                                last_status_update = std::time::Instant::now();
+                            }
                             video_view.push_frame(&frame);
                         }
                         AppEvent::Failed(reason) => {

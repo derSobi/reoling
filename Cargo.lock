@@ -917,6 +917,7 @@ dependencies = [
  "md-5",
  "rand",
  "reolink-protocol",
+ "socket2",
  "tokio",
  "tokio-stream",
 ]

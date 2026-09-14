@@ -7,7 +7,7 @@ use crate::transport::discovery::{connect_by_uid, PeerHandle};
 use crate::Error;
 use md5::{Digest, Md5};
 use std::sync::Arc;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc::channel;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
@@ -68,7 +68,7 @@ impl ReolinkClient {
     /// Resolves `uid` over Reolink's P2P infrastructure and opens the data
     /// connection. Does not log in yet — call `login` next.
     pub async fn connect_by_uid(uid: &str) -> crate::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let socket = Arc::new(crate::transport::bind_udp_socket_with_large_rcvbuf().await?);
         let peer: PeerHandle = connect_by_uid(&socket, uid).await?;
         let connection = BcConnection::new(socket, peer);
         let keepalive = connection.spawn_direct_keepalive();
@@ -82,7 +82,7 @@ impl ReolinkClient {
     /// server gave us any device address at all. See
     /// `transport::discovery::connect_by_uid_prefer_direct`.
     pub async fn connect_by_uid_prefer_direct(uid: &str) -> crate::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let socket = Arc::new(crate::transport::bind_udp_socket_with_large_rcvbuf().await?);
         let peer: PeerHandle =
             crate::transport::discovery::connect_by_uid_prefer_direct(&socket, uid).await?;
         let connection = BcConnection::new(socket, peer);
@@ -111,7 +111,7 @@ impl ReolinkClient {
     /// only resolved via relay, or if the direct TCP connect itself
     /// fails.
     pub async fn connect_by_uid_prefer_tcp(uid: &str) -> crate::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let socket = Arc::new(crate::transport::bind_udp_socket_with_large_rcvbuf().await?);
         let peer: PeerHandle =
             crate::transport::discovery::connect_by_uid_prefer_direct_bounded(&socket, uid)
                 .await?;
@@ -484,6 +484,7 @@ impl ReolinkClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UdpSocket;
     use tokio_stream::StreamExt;
 
     /// Drives a `BcConnection` as if it were the camera: legacy login,

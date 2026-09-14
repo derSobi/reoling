@@ -15,6 +15,16 @@ pub enum ConnectTarget {
     Ip { addr: IpAddr, port: u16 },
 }
 
+/// Which transport a UID connection should try — debug-only, set by the
+/// app's own `--prefer-tcp`/`--prefer-udp` CLI flags (see `main.rs`) to let
+/// the two paths be compared side by side on real hardware. Not exposed in
+/// the connect dialog itself; `PreferTcp` is the default either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UidTransport {
+    PreferTcp,
+    Udp,
+}
+
 /// Spawns a dedicated tokio runtime on a background OS thread and drives the
 /// whole connect→login→start_video flow there, forwarding progress to the
 /// GTK main loop over an `async-channel` (GTK4/GLib are not thread-safe, so
@@ -26,6 +36,7 @@ pub fn spawn_connection(
     password: String,
     channel_id: u8,
     quality: StreamQuality,
+    uid_transport: UidTransport,
 ) -> async_channel::Receiver<AppEvent> {
     let (tx, rx) = async_channel::unbounded();
 
@@ -40,8 +51,13 @@ pub fn spawn_connection(
                 // retransmission bitmap, `bcudp::model::UdpAck`, isn't
                 // implemented), while TCP's in-kernel retransmission and
                 // ordering delivers frames smoothly. See
-                // `ReolinkClient::connect_by_uid_prefer_tcp`.
-                ConnectTarget::Uid(uid) => ReolinkClient::connect_by_uid_prefer_tcp(&uid).await,
+                // `ReolinkClient::connect_by_uid_prefer_tcp`. `--prefer-udp`
+                // forces the plain UDP session instead, to A/B the two on
+                // real hardware.
+                ConnectTarget::Uid(uid) => match uid_transport {
+                    UidTransport::PreferTcp => ReolinkClient::connect_by_uid_prefer_tcp(&uid).await,
+                    UidTransport::Udp => ReolinkClient::connect_by_uid(&uid).await,
+                },
                 ConnectTarget::Ip { addr, port } => ReolinkClient::connect_by_ip(addr, port).await,
             };
             let mut client = match connect_result {

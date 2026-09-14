@@ -2,7 +2,7 @@ mod bridge;
 mod connect_dialog;
 mod video_view;
 
-use bridge::{spawn_connection, AppEvent};
+use bridge::{spawn_connection, AppEvent, UidTransport};
 use connect_dialog::build_connect_dialog;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Button, HeaderBar, Label};
@@ -11,12 +11,24 @@ use video_view::VideoView;
 
 fn main() {
     gstreamer::init().expect("failed to initialize GStreamer");
+    video_view::disable_hardware_video_decoders();
+
+    // Debug-only, not shown anywhere in the UI: lets the TCP-preferring UID
+    // connect path (the default — see `bridge::spawn_connection`) be A/B'd
+    // against the plain UDP/P2P session on real hardware. Parsed by hand
+    // and never handed to `app.run()` — GTK's own argv parser rejects
+    // options it doesn't recognize.
+    let uid_transport = if std::env::args().any(|a| a == "--prefer-udp") {
+        UidTransport::Udp
+    } else {
+        UidTransport::PreferTcp
+    };
 
     let app = Application::builder()
         .application_id("de.dersobi.reoling")
         .build();
 
-    app.connect_activate(|app| {
+    app.connect_activate(move |app| {
         let window = ApplicationWindow::builder()
             .application(app)
             .title("Reoling")
@@ -57,7 +69,8 @@ fn main() {
         let dialog_widget_for_hide = dialog_container.clone();
         build_connect_dialog(&dialog_container, move |device_name, target, username, password, channel_id, quality| {
             status_label_for_dialog.set_text("Connecting...");
-            let receiver = spawn_connection(target, username, password, channel_id, quality);
+            let receiver =
+                spawn_connection(target, username, password, channel_id, quality, uid_transport);
             let status_label = status_label_for_dialog.clone();
             let video_view = Rc::clone(&video_view_for_dialog);
             let header = header_for_dialog.clone();
@@ -99,5 +112,8 @@ fn main() {
         window.present();
     });
 
-    app.run();
+    // `run_with_args::<&str>(&[])` rather than `run()`: GTK's own argv
+    // parser doesn't know `--prefer-udp` (parsed by hand above) and would
+    // reject it as an invalid option.
+    app.run_with_args::<&str>(&[]);
 }

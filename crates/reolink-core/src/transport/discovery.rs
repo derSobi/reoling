@@ -536,6 +536,46 @@ pub async fn connect_by_uid_prefer_direct(socket: &UdpSocket, uid: &str) -> crat
     connect_relay(socket, lookup.reg, relay_addr, &register_result, client_id).await
 }
 
+/// A real device that IS reachable directly responds to `C2D_T` within
+/// about a second (matches `connect_by_uid_prefer_direct`'s own observed
+/// timing); a device that ISN'T only tells us so via the register server's
+/// `R2C_DISC`, sent roughly `OVERALL_TIMEOUT` after the attempt starts (see
+/// `connect_direct`'s own doc comment). Bounding the attempt at this much
+/// shorter timeout instead turns "device unreachable directly" into a
+/// prompt fall-through to relay rather than a multi-second hang that reads,
+/// to a user watching a static "Connecting..." label, as the app simply
+/// not connecting — confirmed against real hardware 2026-09-14 (VPN off,
+/// so the device really isn't reachable directly) via
+/// `ReolinkClient::connect_by_uid_prefer_tcp`, the only caller.
+const OPPORTUNISTIC_DIRECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Like `connect_by_uid_prefer_direct`, but bounds the opportunistic direct
+/// attempt at `OPPORTUNISTIC_DIRECT_TIMEOUT` instead of letting it run the
+/// full `OVERALL_TIMEOUT` before falling back to relay. Used by
+/// `ReolinkClient::connect_by_uid_prefer_tcp` to attempt a direct (and
+/// from there, TCP) session without a long hang on devices that turn out
+/// not to be reachable directly.
+pub async fn connect_by_uid_prefer_direct_bounded(
+    socket: &UdpSocket,
+    uid: &str,
+) -> crate::Result<PeerHandle> {
+    let (lookup, register_result, client_id) = resolve_and_register(socket, uid).await?;
+
+    if let Some(dev_addr) = register_result.dev {
+        if let Ok(Ok(peer)) = timeout(
+            OPPORTUNISTIC_DIRECT_TIMEOUT,
+            connect_direct(socket, lookup.reg, dev_addr, &register_result, client_id),
+        )
+        .await
+        {
+            return Ok(peer);
+        }
+    }
+
+    let relay_addr = register_result.relay.unwrap_or(lookup.relay);
+    connect_relay(socket, lookup.reg, relay_addr, &register_result, client_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

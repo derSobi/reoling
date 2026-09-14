@@ -92,8 +92,10 @@ impl ReolinkClient {
         Ok(client)
     }
 
-    /// Resolves `uid` the same way `connect_by_uid_prefer_direct` does, but
-    /// when that resolution reaches the device directly (not through
+    /// Resolves `uid` the same way `connect_by_uid_prefer_direct` does
+    /// (bounded to a short timeout for the direct attempt specifically —
+    /// see `transport::discovery::connect_by_uid_prefer_direct_bounded`),
+    /// but when that resolution reaches the device directly (not through
     /// relay), continues the session over TCP:9000 (`connect_by_ip`)
     /// instead of the UDP/P2P transport. `.plans/reolink-protocols.md`
     /// documents Baichuan TCP as the NVR/powered-camera family's primary,
@@ -111,7 +113,8 @@ impl ReolinkClient {
     pub async fn connect_by_uid_prefer_tcp(uid: &str) -> crate::Result<Self> {
         let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let peer: PeerHandle =
-            crate::transport::discovery::connect_by_uid_prefer_direct(&socket, uid).await?;
+            crate::transport::discovery::connect_by_uid_prefer_direct_bounded(&socket, uid)
+                .await?;
         if peer.is_direct {
             const BASIC_SERVICE_PORT: u16 = 9000;
             if let Ok(client) = Self::connect_by_ip(peer.addr.ip(), BASIC_SERVICE_PORT).await {

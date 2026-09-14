@@ -4,6 +4,33 @@ use gtk4::Picture;
 use reolink_core::{VideoFrame, VideoType};
 use std::cell::RefCell;
 
+/// `decodebin` autoplugs the highest-ranked decoder for a format, which on
+/// this class of system is a hardware one (`nvh264dec`/`nvh265dec` via
+/// NVDEC). Its output is GPU-resident (`video/x-raw(memory:CUDAMemory)`),
+/// which `gtk4paintablesink` doesn't accept directly (`GST_CAPS ... not
+/// accepted` in `GST_DEBUG`), and with it in the loop `gtk4paintablesink`
+/// falls further and further behind the decoder's own output rate for the
+/// life of the session (`Dropping frame due to QoS` on the large majority
+/// of frames) — visibly choppy playback, confirmed against real hardware
+/// 2026-09-14. Promoting the rank of `cudadownload`/`cudaconvert` (present
+/// on this system per `gst-inspect-1.0`, but shipped with `Rank::NONE`,
+/// which excludes them from autoplugging) was tried as a fix and
+/// **disproven** — `decodebin` still didn't insert either one and the
+/// exact same caps warning and QoS drops persisted; whatever `decodebin`
+/// needs to autoplug a bridge here, rank alone isn't it. Disabling the
+/// hardware decoders outright is the only fix confirmed to actually work.
+/// At the resolution this app requests by default (the sub-stream)
+/// software decoding has CPU headroom to spare; the 4K main stream still
+/// struggles in software and remains a known follow-up. Call once, before
+/// building any pipeline.
+pub fn disable_hardware_video_decoders() {
+    for factory_name in ["nvh264dec", "nvh265dec", "nvh264sldec", "nvh265sldec", "vah264dec", "vah265dec"] {
+        if let Some(factory) = gstreamer::ElementFactory::find(factory_name) {
+            factory.set_rank(gstreamer::Rank::NONE);
+        }
+    }
+}
+
 struct Pipeline {
     appsrc: AppSrc,
     _pipeline: gstreamer::Pipeline,
@@ -49,6 +76,20 @@ impl VideoView {
         ));
         appsrc.set_is_live(true);
         appsrc.set_format(gstreamer::Format::Time);
+        // `frame.microseconds` is the camera's own device-uptime counter,
+        // unrelated to this pipeline's clock/base-time — using it as PTS
+        // (the previous approach) meant `sync: true` on the sink could
+        // defer rendering indefinitely, and disabling sync entirely (also
+        // tried) let the decoder flood `gtk4paintablesink` with frames
+        // faster than it could paint them ("Have too many pending frames"
+        // in GST_DEBUG, confirmed against real hardware 2026-09-14 — the
+        // visible stutter was this, not the network transport a prior
+        // investigation this same session had already fixed separately).
+        // `do-timestamp` makes appsrc stamp each buffer's PTS from the
+        // pipeline clock at the moment it's pushed instead, so the default
+        // `sync: true` paces playback against real elapsed time like any
+        // other live source.
+        appsrc.set_do_timestamp(true);
 
         let parse = gstreamer::ElementFactory::make(parse_name)
             .build()
@@ -56,32 +97,42 @@ impl VideoView {
         let decodebin = gstreamer::ElementFactory::make("decodebin")
             .build()
             .expect("decodebin element missing");
+        // Without a queue, GStreamer's live-pipeline latency calculation
+        // has no buffering to work with and collapses to zero (it says so
+        // itself: "Pipeline construction is invalid, please add queues" —
+        // confirmed via GST_DEBUG=3 against real hardware 2026-09-14).
+        // With zero latency budget, a frame's QoS deadline is "decoded and
+        // painted instantly, no slack" — any real decode time at all
+        // makes it "late", so it gets dropped (`Dropping frame due to
+        // QoS`, logged for nearly every frame). `leaky=downstream` with a
+        // bounded time window gives decode a real deadline to hit while
+        // still discarding backlog (rather than stalling upstream) if
+        // painting itself ever falls behind.
+        let queue = gstreamer::ElementFactory::make("queue")
+            .property("max-size-time", 500_000_000u64) // 500ms
+            .property("max-size-buffers", 0u32)
+            .property("max-size-bytes", 0u32)
+            .property_from_str("leaky", "downstream")
+            .build()
+            .expect("queue element missing — install gstreamer1.0-plugins-base");
         let sink = gstreamer::ElementFactory::make("gtk4paintablesink")
             .build()
             .expect("gtk4paintablesink missing — install gstreamer1.0-plugins-good/gtk4 support");
-        // `microseconds` in each VideoFrame is the camera's own device-uptime
-        // counter, not wall-clock time — it has no relationship to this
-        // pipeline's clock/base-time. With the default `sync: true`, the
-        // sink schedules each buffer's display against that meaningless
-        // PTS, which can defer rendering indefinitely (buffers accepted by
-        // appsrc, decoded, but never actually painted). Disable clock sync
-        // so decoded frames are shown as soon as they're ready, same as any
-        // live-camera-viewer pipeline with a foreign timestamp source.
-        sink.set_property("sync", false);
 
         pipeline
-            .add_many([appsrc.upcast_ref(), &parse, &decodebin, &sink])
+            .add_many([appsrc.upcast_ref(), &parse, &decodebin, &queue, &sink])
             .expect("adding elements failed");
         appsrc.link(&parse).expect("linking appsrc->parse failed");
         parse.link(&decodebin).expect("linking parse->decodebin failed");
+        queue.link(&sink).expect("linking queue->sink failed");
 
         // decodebin exposes its output pad only once it knows the format, so
-        // link decodebin->sink lazily.
-        let sink_clone = sink.clone();
+        // link decodebin->queue lazily.
+        let queue_clone = queue.clone();
         decodebin.connect_pad_added(move |_element, pad| {
-            let sink_pad = sink_clone.static_pad("sink").expect("sink always has a sink pad");
-            if !sink_pad.is_linked() {
-                let _ = pad.link(&sink_pad);
+            let queue_pad = queue_clone.static_pad("sink").expect("queue always has a sink pad");
+            if !queue_pad.is_linked() {
+                let _ = pad.link(&queue_pad);
             }
         });
 
@@ -93,20 +144,15 @@ impl VideoView {
         Pipeline { appsrc, _pipeline: pipeline }
     }
 
-    /// Pushes one raw access unit into the pipeline. `microseconds` becomes
-    /// the buffer's presentation timestamp.
+    /// Pushes one raw access unit into the pipeline. PTS is assigned by
+    /// `do-timestamp` (see `build_pipeline`), not from `frame.microseconds`.
     pub fn push_frame(&self, frame: &VideoFrame) {
         if self.pipeline.borrow().is_none() {
             let pipeline = self.build_pipeline(frame.video_type);
             *self.pipeline.borrow_mut() = Some(pipeline);
         }
 
-        let mut buffer = gstreamer::Buffer::from_slice(frame.data.clone());
-        buffer
-            .get_mut()
-            .unwrap()
-            .set_pts(gstreamer::ClockTime::from_useconds(frame.microseconds as u64));
-
+        let buffer = gstreamer::Buffer::from_slice(frame.data.clone());
         let pipeline_ref = self.pipeline.borrow();
         let _ = pipeline_ref.as_ref().unwrap().appsrc.push_buffer(buffer);
     }

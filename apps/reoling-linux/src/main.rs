@@ -11,7 +11,6 @@ use video_view::VideoView;
 
 fn main() {
     gstreamer::init().expect("failed to initialize GStreamer");
-    video_view::disable_hardware_video_decoders();
 
     // Debug-only, not shown anywhere in the UI: lets the TCP-preferring UID
     // connect path (the default — see `bridge::spawn_connection`) be A/B'd

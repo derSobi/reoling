@@ -112,6 +112,28 @@ fn main() {
                                 last_status_update = std::time::Instant::now();
                             }
                             video_view.push_frame(&frame);
+                            // Frames often arrive in network bursts —
+                            // `receiver.recv().await` resolving immediately
+                            // for an already-queued event doesn't
+                            // necessarily hand control back to the GLib
+                            // main loop first, so a burst can run this
+                            // whole loop body several times back to back
+                            // with no chance for anything else on this
+                            // thread (including gtk4paintablesink's own
+                            // scheduled repaint) to run in between.
+                            // Confirmed against real hardware 2026-09-14:
+                            // GST_DEBUG showed the pipeline's QoS
+                            // `earliest_time` reference frozen for a
+                            // whole burst of dropped frames, then jumping
+                            // forward by as much as ~1.8s in one step —
+                            // the sink simply wasn't getting scheduled to
+                            // paint during that stretch, playback visibly
+                            // dropping to ~1fps with big jumps. A
+                            // zero-duration timeout future still goes
+                            // through the main loop's normal dispatch, so
+                            // it lets any pending paint get serviced
+                            // before this loop resumes.
+                            glib::timeout_future(std::time::Duration::ZERO).await;
                         }
                         AppEvent::Failed(reason) => {
                             status_label.set_text(&format!("Error: {reason}"))

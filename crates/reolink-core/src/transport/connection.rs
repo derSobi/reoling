@@ -22,6 +22,21 @@ const MAX_FRAGMENT_SIZE: usize = 1300;
 /// `next_expected_packet_id` must not drive a multi-GiB allocation here.
 const ACK_BITMAP_CAP: u32 = 4096;
 
+/// Acks are coalesced instead of sent for every single received `UdpData`
+/// packet — confirmed against real hardware 2026-09-14 via a side-by-side
+/// `tcpdump` of this client against the official Windows app, both over
+/// the same relay session: the official app sends only an occasional ack
+/// (roughly one per 15-30 incoming packets), while this client — acking
+/// unconditionally on every packet — was sending long back-to-back runs
+/// of outgoing acks, plausibly starving its own receive loop of the
+/// syscall/scheduling time it needed to keep up, on a stream (the main/4K
+/// one) large enough to fragment into hundreds of packets per frame. An
+/// ack still carries the same cumulative `packet_id` + missing-packet
+/// bitmap regardless of cadence, so coalescing loses no information the
+/// peer needs — just how often it's resent.
+const ACK_MIN_INTERVAL: Duration = Duration::from_millis(20);
+const ACK_BATCH_SIZE: u32 = 16;
+
 /// `recv_bc`'s receive loop skips discovery-channel packets it doesn't act
 /// on (see below) rather than erroring — without a bound on the whole loop,
 /// a peer that only ever sends chatter (or nothing at all) on that channel
@@ -63,6 +78,9 @@ enum Socket {
         send_packet_id: u32,
         next_expected_packet_id: u32,
         out_of_order: BTreeMap<u32, Vec<u8>>,
+        // Ack coalescing state — see `ACK_MIN_INTERVAL`/`ACK_BATCH_SIZE`.
+        last_ack_sent: Option<std::time::Instant>,
+        packets_since_ack: u32,
     },
     /// Direct TCP (Baichuan's "Basic Service", typically port 9000). A
     /// plain ordered byte stream — `write_bc`'s output goes straight on
@@ -90,6 +108,8 @@ impl BcConnection {
                 send_packet_id: 0,
                 next_expected_packet_id: 0,
                 out_of_order: BTreeMap::new(),
+                last_ack_sent: None,
+                packets_since_ack: 0,
             },
             reassembly: Vec::new(),
             bin_mode: HashSet::new(),
@@ -269,8 +289,15 @@ impl BcConnection {
             };
             match msg {
                 BcUdp::Data(data) => {
-                    let Socket::Udp { socket, peer, next_expected_packet_id, out_of_order, .. } =
-                        &mut self.socket
+                    let Socket::Udp {
+                        socket,
+                        peer,
+                        next_expected_packet_id,
+                        out_of_order,
+                        last_ack_sent,
+                        packets_since_ack,
+                        ..
+                    } = &mut self.socket
                     else {
                         unreachable!("recv_bc_loop_udp called on a non-UDP connection");
                     };
@@ -280,14 +307,21 @@ impl BcConnection {
                         *next_expected_packet_id += 1;
                     }
 
-                    let ack = BcUdp::Ack(UdpAck {
-                        connection_id: peer.remote_connection_id,
-                        group_id: 0,
-                        packet_id: next_expected_packet_id.wrapping_sub(1),
-                        maybe_latency: 0,
-                        payload: build_ack_payload(*next_expected_packet_id, out_of_order),
-                    });
-                    socket.send_to(&write_bcudp(&ack), peer.addr).await?;
+                    *packets_since_ack += 1;
+                    let due_to_time =
+                        last_ack_sent.map_or(true, |t| t.elapsed() >= ACK_MIN_INTERVAL);
+                    if *packets_since_ack >= ACK_BATCH_SIZE || due_to_time {
+                        let ack = BcUdp::Ack(UdpAck {
+                            connection_id: peer.remote_connection_id,
+                            group_id: 0,
+                            packet_id: next_expected_packet_id.wrapping_sub(1),
+                            maybe_latency: 0,
+                            payload: build_ack_payload(*next_expected_packet_id, out_of_order),
+                        });
+                        socket.send_to(&write_bcudp(&ack), peer.addr).await?;
+                        *last_ack_sent = Some(std::time::Instant::now());
+                        *packets_since_ack = 0;
+                    }
 
                     if let Some((bc, used)) = read_bc(&self.reassembly, enc, &mut self.bin_mode)? {
                         self.reassembly.drain(..used);

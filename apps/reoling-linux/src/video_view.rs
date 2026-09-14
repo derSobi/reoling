@@ -2,11 +2,27 @@ use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
 use gtk4::Picture;
 use reolink_core::{VideoFrame, VideoType};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+
+/// How far into the pipeline's running time the very first frame is
+/// scheduled to display — the jitter buffer. Frames arrive from the
+/// camera over UDP/P2P (or even TCP under real network jitter) with
+/// uneven spacing even though the camera itself captures at a steady
+/// cadence (`frame.microseconds` advances by a near-constant ~40ms at
+/// 25fps — confirmed against real hardware 2026-09-14, `gap_since_last`
+/// in `probe_login_video`'s own output bounces between ~0ms and ~85ms for
+/// a camera clock that never deviates from ~40ms). Without slack, the
+/// player has no room to smooth that back out before display.
+const PLAYOUT_DELAY: gstreamer::ClockTime = gstreamer::ClockTime::from_mseconds(500);
 
 struct Pipeline {
     appsrc: AppSrc,
-    _pipeline: gstreamer::Pipeline,
+    pipeline: gstreamer::Pipeline,
+    // The camera's own capture clock (`frame.microseconds`) mapped onto
+    // this pipeline's running time, established from the first frame —
+    // see `push_frame`'s doc comment for why this replaces `do-timestamp`.
+    first_camera_us: Cell<Option<u32>>,
+    first_pipeline_pts: Cell<Option<gstreamer::ClockTime>>,
 }
 
 pub struct VideoView {
@@ -60,15 +76,9 @@ impl VideoView {
         ));
         appsrc.set_is_live(true);
         appsrc.set_format(gstreamer::Format::Time);
-        // `frame.microseconds` is the camera's own device-uptime counter,
-        // unrelated to this pipeline's clock/base-time — using it as PTS
-        // made every frame's QoS deadline meaningless regardless of `sync`.
-        // `do-timestamp` makes appsrc stamp each buffer's PTS from the
-        // pipeline clock at the moment it's pushed instead, so `sync: true`
-        // (the sink's default) paces playback against real elapsed time
-        // like any other live source. Confirmed against real hardware
-        // 2026-09-14 alongside the queue below.
-        appsrc.set_do_timestamp(true);
+        // No `do-timestamp` here — see `push_frame`'s doc comment for why
+        // PTS is instead computed manually from the camera's own capture
+        // clock plus a playout delay.
 
         let parse = gstreamer::ElementFactory::make(parse_name)
             .build()
@@ -80,16 +90,19 @@ impl VideoView {
         // Without a queue, GStreamer's live-pipeline latency calculation
         // has no buffering to work with and collapses to zero ("Pipeline
         // construction is invalid, please add queues" — confirmed via
-        // GST_DEBUG=3 against real hardware 2026-09-14). With zero latency
-        // budget, a frame's QoS deadline is "decoded and painted instantly,
-        // no slack" — any real decode time at all makes it "late", so it
-        // gets dropped (`Dropping frame due to QoS`, logged for nearly
-        // every frame). `leaky=downstream` with a bounded time window
-        // gives decode a real deadline to hit while still discarding
-        // backlog (rather than stalling upstream) if painting itself ever
-        // falls behind.
+        // GST_DEBUG=3 against real hardware 2026-09-14). Its capacity must
+        // stay comfortably above `PLAYOUT_DELAY`: buffers now carry PTS
+        // spaced at the camera's real ~40ms cadence (see `push_frame`), so
+        // a burst of several frames arriving close together in real time
+        // still spans real *virtual* time once queued. A tighter cap here
+        // (500ms was tried) makes `leaky=downstream` fire on ordinary
+        // bursts and discard whichever buffers are closest to their
+        // display time — confirmed against real hardware 2026-09-14: the
+        // manual-PTS fix above made playback *worse* (~1fps, large jumps)
+        // until this was widened, because most of every burst was being
+        // leaked before it ever reached the sink.
         let queue = gstreamer::ElementFactory::make("queue")
-            .property("max-size-time", 500_000_000u64) // 500ms
+            .property("max-size-time", 3_000_000_000u64) // 3s
             .property("max-size-buffers", 0u32)
             .property("max-size-bytes", 0u32)
             .property_from_str("leaky", "downstream")
@@ -112,19 +125,60 @@ impl VideoView {
 
         pipeline.set_state(gstreamer::State::Playing).expect("failed to start pipeline");
 
-        Pipeline { appsrc, _pipeline: pipeline }
+        Pipeline {
+            appsrc,
+            pipeline,
+            first_camera_us: Cell::new(None),
+            first_pipeline_pts: Cell::new(None),
+        }
     }
 
-    /// Pushes one raw access unit into the pipeline. PTS is assigned by
-    /// `do-timestamp` (see `build_pipeline`), not from `frame.microseconds`.
+    /// Pushes one raw access unit into the pipeline. PTS is computed from
+    /// the camera's own capture clock (`frame.microseconds`), not from
+    /// arrival time. Real hardware testing 2026-09-14 (see
+    /// `.plans/reoling-video-stutter-diagnosis.md`) found that
+    /// `appsrc.set_do_timestamp(true)` — stamping each buffer's PTS at the
+    /// moment it's pushed — turns network arrival jitter directly into
+    /// playback jitter: the camera captures at a steady ~40ms cadence, but
+    /// frames arrive unevenly (bursts, gaps up to ~85ms in the same
+    /// capture-steady session), and with `sync: true` the sink replayed
+    /// exactly that uneven arrival pattern. Mapping the camera's own clock
+    /// onto the pipeline's running time (anchored at the first frame, plus
+    /// `PLAYOUT_DELAY` of slack to absorb jitter) reconstructs the
+    /// camera's steady cadence instead.
     pub fn push_frame(&self, frame: &VideoFrame) {
         if self.pipeline.borrow().is_none() {
             let pipeline = self.build_pipeline(frame.video_type);
             *self.pipeline.borrow_mut() = Some(pipeline);
         }
 
-        let buffer = gstreamer::Buffer::from_slice(frame.data.clone());
         let pipeline_ref = self.pipeline.borrow();
-        let _ = pipeline_ref.as_ref().unwrap().appsrc.push_buffer(buffer);
+        let p = pipeline_ref.as_ref().unwrap();
+
+        let first_camera_us = p.first_camera_us.get().unwrap_or_else(|| {
+            p.first_camera_us.set(Some(frame.microseconds));
+            frame.microseconds
+        });
+        let first_pipeline_pts = p.first_pipeline_pts.get().unwrap_or_else(|| {
+            let now = p.pipeline.current_running_time().unwrap_or(gstreamer::ClockTime::ZERO);
+            let pts = now + PLAYOUT_DELAY;
+            p.first_pipeline_pts.set(Some(pts));
+            pts
+        });
+
+        // `frame.microseconds` is a u32 device-uptime counter that wraps
+        // every ~71.58 minutes; `wrapping_sub` keeps the delta correct
+        // across a single wrap. A session running long enough to wrap
+        // *twice* relative to its own first frame would need a proper
+        // timestamp extender, not implemented here yet.
+        let camera_delta = gstreamer::ClockTime::from_useconds(
+            frame.microseconds.wrapping_sub(first_camera_us) as u64,
+        );
+        let pts = first_pipeline_pts + camera_delta;
+
+        let mut buffer = gstreamer::Buffer::from_slice(frame.data.clone());
+        buffer.get_mut().unwrap().set_pts(pts);
+
+        let _ = p.appsrc.push_buffer(buffer);
     }
 }

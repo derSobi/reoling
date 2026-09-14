@@ -17,7 +17,7 @@ const PLAYOUT_DELAY: gstreamer::ClockTime = gstreamer::ClockTime::from_mseconds(
 
 struct Pipeline {
     appsrc: AppSrc,
-    pipeline: gstreamer::Pipeline,
+    _pipeline: gstreamer::Pipeline,
     // The camera's own capture clock (`frame.microseconds`) mapped onto
     // this pipeline's running time, established from the first frame —
     // see `push_frame`'s doc comment for why this replaces `do-timestamp`.
@@ -79,6 +79,13 @@ impl VideoView {
         // No `do-timestamp` here — see `push_frame`'s doc comment for why
         // PTS is instead computed manually from the camera's own capture
         // clock plus a playout delay.
+        // appsrc's own default internal buffer (`max-bytes`) is 200KB —
+        // at the real main-stream bitrate (confirmed via the camera's own
+        // GetEnc API: 8192 kbit/s, ~1MB/s) that's under 200ms of data,
+        // far short of `PLAYOUT_DELAY` + the queue's own capacity below.
+        // Raised well past what a few seconds of main-stream data needs
+        // so appsrc itself is never the bottleneck holding frames back.
+        appsrc.set_property("max-bytes", 16 * 1024 * 1024u64);
 
         let parse = gstreamer::ElementFactory::make(parse_name)
             .build()
@@ -127,7 +134,7 @@ impl VideoView {
 
         Pipeline {
             appsrc,
-            pipeline,
+            _pipeline: pipeline,
             first_camera_us: Cell::new(None),
             first_pipeline_pts: Cell::new(None),
         }
@@ -160,8 +167,16 @@ impl VideoView {
             frame.microseconds
         });
         let first_pipeline_pts = p.first_pipeline_pts.get().unwrap_or_else(|| {
-            let now = p.pipeline.current_running_time().unwrap_or(gstreamer::ClockTime::ZERO);
-            let pts = now + PLAYOUT_DELAY;
+            // Not `p._pipeline.current_running_time()`: right after
+            // `set_state(Playing)` the state change is still async, so
+            // the pipeline's own clock/base-time may not be established
+            // yet and this can read back `None`/stale — a real,
+            // confirmed-plausible source of the first frames' PTS being
+            // anchored wrong for the rest of the session (`first_pipeline_pts`
+            // is cached once, from this single read). The pipeline was
+            // just created; its running time at this point is 0 by
+            // construction, no query needed.
+            let pts = PLAYOUT_DELAY;
             p.first_pipeline_pts.set(Some(pts));
             pts
         });
